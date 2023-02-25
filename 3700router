@@ -1,0 +1,357 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse, socket, time, json, select, struct, sys, math
+import route
+
+class Router:
+
+    relations = {}
+    sockets = {}
+    ports = {}
+
+    ##storage of update history
+    msg_log = []
+    ##forwarding table
+    routes = []
+
+    def __init__(self, asn, connections):
+        print("Router at AS %s starting up" % asn)
+        self.asn = asn
+        for relationship in connections:
+            ##example 61040-192.168.0.2-cust from command line
+            port, neighbor, relation = relationship.split("-")
+            ##opening up sockets 
+            self.sockets[neighbor] = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.sockets[neighbor].bind(('localhost', 0))
+            self.ports[neighbor] = int(port)
+            self.relations[neighbor] = relation
+            ## sending handshakes to each neighbor
+            self.send(neighbor, json.dumps({ "type": "handshake", "src": self.our_addr(neighbor), "dst": neighbor, "msg": {} }))
+    
+    ## takes in the destination of the message and configures our home port's respective address
+    def our_addr(self, dst):
+        quads = list(int(qdn) for qdn in dst.split('.'))
+        quads[3] = 1
+        return "%d.%d.%d.%d" % (quads[0], quads[1], quads[2], quads[3])
+    
+    # takes in the destination network and configures it into the correct neighbor
+    def neighbor_addr(self, dst):
+        quads = list(int(qdn) for qdn in dst.split("."))
+        quads[3] = 2
+        return "%d.%d.%d.%d" % (quads[0], quads[1], quads[2], quads[3])
+    
+    ## sends the message to the given neighbor network
+    def send(self, network, message):
+        self.sockets[network].sendto(message.encode('utf-8'), ('localhost', self.ports[network]))
+
+    def run(self):
+        while True:
+            socks = select.select(self.sockets.values(), [], [], 0.1)[0]
+            for conn in socks:
+                k, addr = conn.recvfrom(65535)
+                srcif = None
+                for sock in self.sockets:
+                    if self.sockets[sock] == conn:
+                        srcif = sock
+                        break
+                msg = k.decode('utf-8')
+                print("Received message '%s' from %s" % (msg, srcif))
+                msg_d = json.loads(msg)
+
+                ## determine type of message and handle it correctly
+                type = msg_d["type"]
+                if (type == "update"):
+                    self.update(msg_d)
+                elif (type == "data"):
+                    self.data(msg_d, srcif)
+                elif (type == "dump"):
+                    self.dump(msg_d)
+                elif (type == "withdraw"):
+                    self.withdraw(msg_d, srcif)
+
+        return
+    
+
+    def update(self, msg_d):
+
+        ## save record of the update
+        self.msg_log.append(msg_d)
+
+        ## determine relationship with source port
+        ship = self.relations[msg_d["src"]]
+
+        ## create routing address object
+        route_add = route.Route(msg_d["msg"], msg_d["src"])
+
+        ## look for possible aggregation, which will add to routing table accordingly
+        self.aggregate(route_add)
+
+        ## forward routing announcement
+        ## if update from customer, send route update to everyone
+        if ship == "cust":
+            for neighbor in self.relations:
+                if neighbor != msg_d["src"]:
+                    self.send(neighbor, json.dumps({ "type": "update", "src": self.our_addr(neighbor), 
+                    "dst": neighbor, 'msg': {'network': route_add.network, 
+                    'netmask': route_add.netmask, 'ASPath': [self.asn] + route_add.ASPath}}))
+        else:
+            ##forward only to customers
+            for neighbor in self.relations:
+                if neighbor != msg_d["src"] and self.relations[neighbor] == "cust":
+                    self.send(neighbor, json.dumps({ "type": "update", "src": self.our_addr(neighbor), 
+                    "dst": neighbor, 'msg': {'network': route_add.network, 
+                    'netmask': route_add.netmask, 'ASPath': [self.asn] + route_add.ASPath}}))
+    
+    def aggregate(self, route_add):
+
+        ## this variable determines if the route needs to be added to the table or not
+        x = 0
+
+        for routey in self.routes:
+            ## checking if all the fields are the same in the route
+            if (route_add.peer != routey.peer
+                    or route_add.localpref != routey.localpref
+                    or route_add.ASPath != routey.ASPath
+                    or route_add.selfOrigin != routey.selfOrigin
+                    or route_add.origin != routey.origin
+                    ):
+                    continue
+            ## if the route is already represented by an address, don't add it
+            elif compareAddresses(routey.CIDR, route_add.network):
+                x=1
+                continue
+            ##checking if routes are numerically adjacent
+            elif adjacent(route_add, routey):
+                ##altering current route to aggregate new route
+                if getDecimalofIP(route_add.network) < getDecimalofIP(routey.network):
+                    routey.network = route_add.network
+                    routey.netmask = socket.inet_ntoa(struct.pack("!L", (2**32 - 2 ** (32 - (CIDRPrefix(routey.CIDR) - 1)))))
+                    routey.CIDR = routey.network + "/" + str(CIDRPrefix(routey.CIDR) - 1)
+                else:
+                    routey.netmask = socket.inet_ntoa(struct.pack("!L", (2**32 - 2 ** (32 - (CIDRPrefix(routey.CIDR) - 1)))))
+                    routey.CIDR = routey.network + "/" + str(CIDRPrefix(routey.CIDR) - 1)
+                x = 1
+
+        if x == 0:
+            ## stores the route address in the forward table
+            self.routes.append(route_add)
+    
+
+    ## sends a table message to the network that requested
+    def dump(self, msg_d):
+        msg_list = []
+        for routey in self.routes:
+            route_dict = vars(routey)
+            del route_dict["CIDR"]
+            msg_list.append(route_dict)
+        self.send(msg_d["src"], json.dumps({ "type": "table", "src": self.our_addr(msg_d["src"]), 
+                    "dst": msg_d["src"], 'msg': msg_list}))
+    
+
+    ## withdraws the requested networks from the routing table and sends to others depending on relationship
+    def withdraw(self, msg_d, srcif):
+
+        revokes = msg_d["msg"]
+
+        ## removing update messages from routing table based on revoke
+        for message in self.msg_log:
+            for network in revokes:
+                if (message["msg"]["network"] == network["network"]
+                and message["msg"]["netmask"] == network["netmask"]
+                and srcif == message["src"]):
+                    self.msg_log.remove(message)
+        
+        ##clearing table
+        self.routes = []
+        ##rebuilding table
+        for message in self.msg_log:
+
+            ## create routing address object
+            route_add = route.Route(message["msg"], message["src"])
+
+            ## look for possible aggregation
+            self.aggregate(route_add)
+        
+        ##sending out withdraw messages accordingly
+        ship = self.relations[msg_d["src"]]
+        if ship == "cust":
+            for neighbor in self.relations:
+                if neighbor != msg_d["src"]:
+                    self.send(neighbor, json.dumps({ "type": "withdraw", "src": self.our_addr(neighbor), 
+                    "dst": neighbor, 'msg': msg_d["msg"]}))
+    
+            ##forward message to all
+        else:
+            ##forward only to customers
+            for neighbor in self.relations:
+                if neighbor != msg_d["src"] and self.relations[neighbor] == "cust":
+                    self.send(neighbor, json.dumps({ "type": "withdraw", "src": self.our_addr(neighbor), 
+                    "dst": neighbor, 'msg': msg_d["msg"]}))
+        
+    
+    def data(self, msg_d, srcif):
+
+        ## getting source and destination info
+        dest_ip = msg_d["dst"] 
+        src_prt = srcif
+
+        ##determining what port the destination will be sent to
+        poss_prts = []
+        for routey in self.routes:
+            key = routey.CIDR
+            if compareAddresses(key, dest_ip):
+                poss_prts.append(routey)
+
+        ## if there is no port to send to, send no route message back
+        if len(poss_prts) == 0:
+                self.send(src_prt, json.dumps({"src":  self.our_addr(msg_d["src"]), "dst":  
+                msg_d["src"], "type": "no route", "msg":  {}}))
+        
+        else:
+            prefix_length = 0
+
+            ##determining longest prefix
+            for route in poss_prts:
+                if CIDRPrefix(route.CIDR) > prefix_length:
+                    prefix_length = CIDRPrefix(route.CIDR)
+
+            ## picking routes with longest prefix
+            for route in poss_prts:
+                if CIDRPrefix(route.CIDR) != prefix_length:
+                    poss_prts.remove(route)
+            
+            ##apply the five rules using helper method calcOPT to get the best route
+            dest_prt = calcOPT(poss_prts)
+
+            ##either sends data forward or no route back depending on relationship
+            if self.relations[dest_prt.peer] == "cust" or self.relations[src_prt] == "cust":
+                self.send(dest_prt.peer, json.dumps({"src":  self.our_addr(dest_prt.peer), "dst":  
+                dest_ip, "type": "data", "msg":  msg_d["msg"]}))
+
+            else:
+                self.send(src_prt, json.dumps({"src":  self.our_addr(msg_d["src"]), "dst":  
+                    msg_d["src"], "type": "no route", "msg":  {}}))
+
+
+## calculates the best route using the 5 rules froma  given list of possible routes
+def calcOPT(poss_routes):
+    ## creating a dummy starter route to compare to
+    base_info = {
+        "network": "0.0.0.0", "netmask": "0.0.0.0", "localpref": -1, "ASPath": [3, 4, 5, 6, 7, 8, 9, 0, 2],
+        "origin": "UNK","selfOrigin": False
+      }
+    base_route = route.Route(base_info, "255.255.255.255")
+
+    ## this variable acts as a kind of depth meter to see how deep into the comparisons we need to look
+    bruh_var = 0
+
+    ## using 5 rules to determine optimal route
+    for routey in poss_routes:
+
+        ## comparing local preference
+        if routey.localpref >= base_route.localpref:
+            if routey.localpref > base_route.localpref:
+                base_route = routey
+                continue
+            bruh_var = 1
+        ## comparing selfOrigin boolean
+        if (routey.selfOrigin and not base_route.selfOrigin) and bruh_var > 0:
+            base_route = routey
+            bruh_var = 2
+            continue
+        if (routey.selfOrigin == base_route.selfOrigin) and bruh_var > 0:
+            bruh_var = 2
+        ## comparing ASPath length
+        if (len(base_route.ASPath) > len(routey.ASPath)) and bruh_var > 1:
+            base_route = routey
+            bruh_var = 3
+            continue
+        if (len(base_route.ASPath) == len(routey.ASPath)) and bruh_var > 1:
+            bruh_var = 3
+        ## compaing Origin type
+        if originCheck(base_route.origin, routey.origin) and bruh_var > 2:
+            base_route = routey
+            bruh_var = 4
+            continue
+        if (base_route.origin == routey.origin) and bruh_var > 2:
+            bruh_var = 4
+        ## comparing IP value
+        if (getDecimalofIP(routey.peer) < getDecimalofIP(base_route.peer)) and bruh_var > 3:
+            base_route = routey
+    return base_route
+
+## comparing two of the three possible origin types to see which is better
+## returns true if the "challenger" is better
+def originCheck(curr, challenger):
+    if curr == challenger:
+        return False
+    elif challenger == "IGP":
+        return True
+    elif challenger == "EGP" and curr == "UNK":
+        return True
+    else:
+        return False
+
+##getting the correct port from the CIDR
+def CIDRtoPort(cidr):
+    parts = cidr.split('/')
+    str = parts[0]
+    return str[:-1] + "2"
+
+##getting the prefix value from a CIDR
+def CIDRPrefix(cidr):
+    parts = cidr.split('/')
+    return int(parts[1])
+
+##getting the prefix value from a CIDR
+def CIDRNetwork(cidr):
+    parts = cidr.split('/')
+    return parts[0]
+
+
+## checks to see if destination ip is contained in the given network, returns boolean
+def compareAddresses(key, dest_ip):
+    ip_address_parts = [int(part) for part in dest_ip.split('.')]
+    cidr_parts = key.split('/')
+    cidr_address_parts = [int(part) for part in cidr_parts[0].split('.')]
+    cidr_prefix_length = int(cidr_parts[1])
+    ip_binary = ''.join(['{0:08b}'.format(part) for part in ip_address_parts])
+    cidr_address_binary = ''.join(['{0:08b}'.format(part) for part in cidr_address_parts])
+    return ip_binary[:cidr_prefix_length] == cidr_address_binary[:cidr_prefix_length]
+
+## returns the decimal value of an ipaddress
+def getDecimalofIP(ip):
+    as_binary = ''.join([bin(int(x)+256)[3:] for x in ip.split('.')])
+    return int(as_binary, 2)
+
+## determines if two cidr networks are numerically adjacent
+def adjacent(route1, route2):
+    
+    rang1 = cidr_range(route1.CIDR, [int(x) for x in route1.netmask.split(".")])
+    rang2 = cidr_range(route2.CIDR, [int(x) for x in route2.netmask.split(".")])
+
+    if (getDecimalofIP(rang1[0]) == getDecimalofIP(rang2[1]) + 1 
+        or getDecimalofIP(rang2[0]) == getDecimalofIP(rang1[1]) + 1):
+        return True
+    else:
+        return False
+
+## returns the first and last ip addresses of the given cidr and netmask
+def cidr_range(cidr, netmask):
+    ip, prefix = cidr.split('/')
+    prefix = int(prefix)
+    ip_b = list(map(int, ip.split('.')))
+    network = [b & m for b, m in zip(ip_b, netmask)]
+    first_ip = ".".join(map(str, network))
+    broadcast = [(b | ~m) & 0xff for b, m in zip(network, netmask)]
+    last_ip = ".".join(map(str, broadcast))
+    return first_ip, last_ip
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='route packets')
+    parser.add_argument('asn', type=int, help="AS number of this router")
+    parser.add_argument('connections', metavar='connections', type=str, nargs='+', help="connections")
+    args = parser.parse_args()
+    router = Router(args.asn, args.connections)
+    router.run()
